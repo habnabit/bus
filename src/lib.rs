@@ -237,25 +237,6 @@ impl Parkable for thread::Thread {
     }
 }
 
-#[cfg(feature = "async")]
-mod async_impls {
-    use futures::task;
-    use super::{BlockCondition, BlockOutcome, Parkable};
-
-    impl Parkable for task::Task {
-        type PreparkState = ();
-        fn current() -> Self { task::current() }
-        fn unpark(&self) { task::Task::notify(self) }
-        fn prepare(block: BlockCondition) { assert_eq!(block, BlockCondition::Try); }
-        fn maybe_park<F>(_: &mut Self::PreparkState, store_parked: F) -> BlockOutcome
-            where F: FnOnce(Self),
-        {
-            store_parked(Self::current());
-            BlockOutcome::CannotBlock
-        }
-    }
-}
-
 /// A Seat is a single location in the circular buffer.
 /// Each Seat knows how many readers are expected to access it, as well as how many have. The
 /// producer will never modify a seat's state unless all readers for a particular seat have either
@@ -415,14 +396,6 @@ impl<T> Bus<T, thread::Thread> {
         if let Err(..) = self.broadcast_inner(val, <thread::Thread as Parkable>::prepare(BlockCondition::Block)) {
             unreachable!("blocking broadcast_inner can't fail");
         }
-    }
-}
-
-#[cfg(feature = "async")]
-impl<T> Bus<T, futures::task::Task> {
-    /// TODO forwards to with_parkable
-    pub fn new_async(len: usize) -> Self {
-        Bus::with_parkable(len)
     }
 }
 
@@ -644,23 +617,6 @@ impl<T, P> Drop for Bus<T, P> {
     }
 }
 
-#[cfg(feature = "async")]
-impl<T: Clone + Sync> futures::Sink for Bus<T, futures::task::Task> {
-    type SinkItem = T;
-    type SinkError = void::Void;
-
-    fn start_send(&mut self, item: Self::SinkItem) -> futures::StartSend<Self::SinkItem, Self::SinkError> {
-        match self.try_broadcast(item) {
-            Ok(()) => Ok(futures::AsyncSink::Ready),
-            Err(item) => Ok(futures::AsyncSink::NotReady(item)),
-        }
-    }
-
-    fn poll_complete(&mut self) -> futures::Poll<(), Self::SinkError> {
-        Ok(futures::Async::Ready(()))
-    }
-}
-
 /// A `BusReader` is a single consumer of `Bus` broadcasts. It will see every new value that is
 /// passed to `.broadcast()` (or successful calls to `.try_broadcast()`) on the `Bus` that it was
 /// created from.
@@ -865,20 +821,6 @@ impl<T, P> Drop for BusReader<T, P> {
     }
 }
 
-#[cfg(feature = "async")]
-impl<T: Clone + Sync> futures::Stream for BusReader<T, futures::task::Task> {
-    type Item = T;
-    type Error = void::Void;
-
-    fn poll(&mut self) -> futures::Poll<Option<Self::Item>, Self::Error> {
-        match self.try_recv() {
-            Ok(value) => Ok(futures::Async::Ready(Some(value))),
-            Err(mpsc::TryRecvError::Disconnected) => Ok(futures::Async::Ready(None)),
-            Err(mpsc::TryRecvError::Empty) => Ok(futures::Async::NotReady),
-        }
-    }
-}
-
 /// An iterator over messages on a receiver. This iterator will block whenever `next` is called,
 /// waiting for a new message, and `None` will be returned when the corresponding channel has been
 /// closed.
@@ -916,6 +858,65 @@ impl<T: Clone + Sync> Iterator for BusIntoIter<T> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
         self.0.recv().ok()
+    }
+}
+
+#[cfg(feature = "async")]
+mod async_impls {
+    use futures::prelude::*;
+    use futures::task;
+    use std::sync::mpsc;
+    use void;
+
+    use super::{BlockCondition, BlockOutcome, Bus, BusReader, Parkable};
+
+    impl Parkable for task::Task {
+        type PreparkState = ();
+        fn current() -> Self { task::current() }
+        fn unpark(&self) { task::Task::notify(self) }
+        fn prepare(block: BlockCondition) { assert_eq!(block, BlockCondition::Try); }
+        fn maybe_park<F>(_: &mut Self::PreparkState, store_parked: F) -> BlockOutcome
+            where F: FnOnce(Self),
+        {
+            store_parked(Self::current());
+            BlockOutcome::CannotBlock
+        }
+    }
+
+    impl<T> Bus<T, task::Task> {
+        /// TODO forwards to with_parkable
+        pub fn new_async(len: usize) -> Self {
+            Bus::with_parkable(len)
+        }
+    }
+
+    impl<T: Clone + Sync> Sink for Bus<T, task::Task> {
+        type SinkItem = T;
+        type SinkError = void::Void;
+
+        fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+            match self.try_broadcast(item) {
+                Ok(()) => Ok(AsyncSink::Ready),
+                Err(item) => Ok(AsyncSink::NotReady(item)),
+            }
+        }
+
+        fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+            Ok(Async::Ready(()))
+        }
+    }
+
+    impl<T: Clone + Sync> Stream for BusReader<T, task::Task> {
+        type Item = T;
+        type Error = void::Void;
+
+        fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+            match self.try_recv() {
+                Ok(value) => Ok(Async::Ready(Some(value))),
+                Err(mpsc::TryRecvError::Disconnected) => Ok(Async::Ready(None)),
+                Err(mpsc::TryRecvError::Empty) => Ok(Async::NotReady),
+            }
+        }
     }
 }
 
