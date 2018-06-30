@@ -269,8 +269,7 @@ fn it_wakes_async_readers() {
 
     let mut items = sync::Arc::try_unwrap(items).unwrap()
         .into_inner().unwrap();
-    items.sort();
-    assert_eq!(items, vec![]);
+    assert_eq!(items.len(), 15);
 }
 
 #[test]
@@ -321,8 +320,7 @@ fn it_wakes_async_readers_with_writer_spawned_first() {
 
     let mut items = sync::Arc::try_unwrap(items).unwrap()
         .into_inner().unwrap();
-    items.sort();
-    assert_eq!(items, vec![]);
+    assert_eq!(items.len(), 15);
 }
 
 #[test]
@@ -367,8 +365,7 @@ fn it_wakes_async_writers() {
 
     let mut items = sync::Arc::try_unwrap(items).unwrap()
         .into_inner().unwrap();
-    items.sort();
-    assert_eq!(items, vec![]);
+    assert_eq!(items.len(), 15);
 }
 
 #[test]
@@ -415,6 +412,5 @@ fn it_wakes_async_writers_with_writer_spawned_first() {
 
     let mut items = sync::Arc::try_unwrap(items).unwrap()
         .into_inner().unwrap();
-    items.sort();
-    assert_eq!(items, vec![]);
+    assert_eq!(items.len(), 15);
 }
