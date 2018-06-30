@@ -7,7 +7,7 @@ extern crate tokio;
 use futures::{future, stream};
 use futures::prelude::*;
 use proptest::prelude::*;
-use std::sync;
+use std::{sync, thread};
 use std::time::{Duration, Instant};
 
 
@@ -57,7 +57,7 @@ fn spawn_deadlined<F>(timeout: Duration, future: F)
 
 proptest! {
     #[test]
-    fn it_wakes_async_writers(run in whole_run(), buffer in 1..15usize) {
+    fn it_delivers_all_messages_async(run in whole_run(), buffer in 1..15usize) {
         let expected_items = run.readers
             .first().as_ref().map(|r| r.delays.len())
             .unwrap_or(0) * run.readers.len();
@@ -101,6 +101,54 @@ proptest! {
 
             Ok(())
         }));
+
+        let mut items = sync::Arc::try_unwrap(items).unwrap()
+            .into_inner().unwrap();
+        prop_assert_eq!(items.len(), expected_items);
+    }
+
+    #[test]
+    fn it_delivers_all_messages_sync(run in whole_run(), buffer in 1..15usize) {
+        let expected_items = run.readers
+            .first().as_ref().map(|r| r.delays.len())
+            .unwrap_or(0) * run.readers.len();
+        let max_delay_sum = run.readers.iter()
+            .map(|r| r.delays.iter())
+            .chain(std::iter::once(run.sender_delays.iter()))
+            .map(|i| i.sum::<Duration>())
+            .max().unwrap_or_else(|| Duration::from_millis(10));
+        let n_readers = run.readers.len();
+        let items = sync::Arc::new(sync::Mutex::new(vec![]));
+        let started_at = Instant::now();
+        let deadline = started_at + (max_delay_sum * 2);
+        let mut bus = bus::Bus::new(buffer);
+
+        let mut threads = run.readers.into_iter()
+            .enumerate()
+            .map(|(nr, reader)| {
+                let mut rx = bus.add_rx();
+                let items = items.clone();
+                thread::spawn(move || {
+                    for delay in reader.delays {
+                        let e = rx.recv().unwrap();
+                        items.lock().unwrap().push((nr, e, started_at.elapsed()));
+                        thread::sleep(delay);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let sender_delays = run.sender_delays;
+        threads.push(thread::spawn(move || {
+            for (e, delay) in sender_delays.into_iter().enumerate() {
+                bus.broadcast(e);
+                thread::sleep(delay);
+            }
+        }));
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
 
         let mut items = sync::Arc::try_unwrap(items).unwrap()
             .into_inner().unwrap();
