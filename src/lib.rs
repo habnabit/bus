@@ -391,9 +391,6 @@ pub struct Bus<T, P = thread::Thread> {
         mpsc::Receiver<(P, usize)>,
     ),
 
-    // channel used to communicate to unparker that a given thread should be woken up
-    unpark: mpsc::Sender<P>,
-
     // cache used to keep track of threads waiting for next write.
     // this is only here to avoid allocating one on every broadcast()
     cache: Vec<(P, usize)>,
@@ -448,23 +445,12 @@ impl<T, P: Parkable> Bus<T, P> {
             len: len,
         });
 
-        // we run a separate thread responsible for unparking
-        // so we don't have to wait for unpark() to return in broadcast_inner
-        // sending on a channel without contention is cheap, unparking is not
-        let (unpark_tx, unpark_rx) = mpsc::channel::<P>();
-        thread::spawn(move || {
-            for t in unpark_rx.iter() {
-                t.unpark();
-            }
-        });
-
         Bus {
             state: inner,
             readers: 0,
             rleft: iter::repeat(0).take(len).collect(),
             leaving: mpsc::channel(),
             waiting: mpsc::channel(),
-            unpark: unpark_tx,
 
             cache: Vec::new(),
         }
@@ -574,7 +560,7 @@ impl<T, P: Parkable> Bus<T, P> {
             if at == tail {
                 self.cache.push((t, at))
             } else {
-                self.unpark.send(t).unwrap();
+                t.unpark();
             }
         }
         for w in self.cache.drain(..) {
