@@ -7,19 +7,139 @@ extern crate tokio;
 use futures::{future, stream};
 use futures::prelude::*;
 use proptest::prelude::*;
-use std::{sync, thread};
+use std::{iter, mem, sync, thread};
 use std::time::{Duration, Instant};
 
 
 fn delay() -> BoxedStrategy<Duration> {
-    (10..200u64)
+    (1..1250u64)
         .prop_map(Duration::from_millis)
         .boxed()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TestReader {
+    id: usize,
     delays: Vec<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SentItem {
+    reader: usize,
+    sent_at: Instant,
+    received_at: Instant,
+}
+
+impl TestReader {
+    fn spawned(self, bus_reader: bus::BusReader<Instant, futures::task::Task>, shared: sync::Arc<Shared>) -> impl Future<Item = (), Error = ()> {
+        let reader = self.id;
+        stream::iter_ok(self.delays)
+            .zip(bus_reader)
+            .map_err(|_| unreachable!())
+            .for_each(move |(delay, sent_at)| -> Box<Future<Item = (), Error = tokio::timer::Error> + Send> {
+                eprintln!("received item to {} from {:?}", reader, sent_at.elapsed());
+                if shared.fuse.load(sync::atomic::Ordering::Relaxed) {
+                    return Box::new(future::err(tokio::timer::Error::shutdown()));
+                }
+                let received_at = Instant::now();
+                shared.items.lock().unwrap().push(SentItem {
+                    reader, sent_at, received_at,
+                });
+                Box::new(tokio::timer::Delay::new(received_at + delay))
+            })
+            .map_err(|e| eprintln!("timer failure"))
+    }
+
+    fn spawned_sync(self, bus_reader: bus::BusReader<Instant>, shared: sync::Arc<Shared>) -> thread::JoinHandle<()> {
+        let TestReader { id: reader, delays } = self;
+        thread::spawn(move || {
+            for (delay, sent_at) in delays.into_iter().zip(bus_reader) {
+                eprintln!("received item to {} from {:?}", reader, sent_at.elapsed());
+                if shared.fuse.load(sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let received_at = Instant::now();
+                shared.items.lock().unwrap().push(SentItem {
+                    reader, sent_at, received_at,
+                });
+                thread::sleep(delay);
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RunStep {
+    DoSend,
+    SpawnReader(TestReader),
+    Wait(Duration),
+}
+
+#[derive(Debug, Clone)]
+struct StepsAndExpected {
+    steps: Vec<RunStep>,
+    expected_counts: Vec<usize>,
+}
+
+fn run_steps() -> BoxedStrategy<StepsAndExpected> {
+    let step = prop_oneof![
+        Just(RunStep::DoSend),
+        Just(RunStep::SpawnReader(TestReader { id: 0, delays: vec![] })),
+        delay().prop_map(RunStep::Wait),
+    ];
+    prop::collection::vec(step, 1..75)
+        .prop_flat_map(|mut steps| {
+            let n_steps = steps.len();
+            let mut possible_reads = vec![None; n_steps];
+            for (e, step) in steps.iter_mut().enumerate() {
+                use RunStep::*;
+                match step {
+                    SpawnReader(reader) => {
+                        reader.id = e;
+                        possible_reads[e] = Some(0u32);
+                    },
+                    DoSend => {
+                        possible_reads.iter_mut()
+                            .filter_map(Option::as_mut)
+                            .for_each(|c: &mut u32| *c += 1);
+                    },
+                    Wait(_) => (),
+                }
+            }
+            let max_reads = possible_reads.iter().filter_map(|o| o.clone()).sum::<u32>() as usize;
+            let reader_delays = if max_reads > 0 {
+                let read_indices = possible_reads.iter().enumerate()
+                    .flat_map(|(e, o)| iter::repeat(e).take(o.unwrap_or(0) as usize))
+                    .collect::<Vec<_>>();
+                (Just(read_indices).prop_shuffle(), prop::collection::vec(delay(), ..max_reads))
+                    .prop_map(move |(mut indices, mut delays)| {
+                        let mut reader_delays = vec![vec![]; n_steps];
+                        while let (Some(idx), Some(delay)) = (indices.pop(), delays.pop()) {
+                            reader_delays[idx].push(delay);
+                        }
+                        reader_delays
+                    })
+                    .boxed()
+            } else {
+                Just(vec![vec![]; n_steps]).boxed()
+            };
+            (reader_delays, Just(steps))
+        })
+        .prop_map(|(mut reader_delays, mut steps)| {
+            let mut expected_counts = vec![0; steps.len()];
+            for (e, step) in steps.iter_mut().enumerate() {
+                use RunStep::*;
+                match step {
+                    SpawnReader(reader) => {
+                        reader.delays = mem::replace(&mut reader_delays[e], vec![]);
+                        expected_counts[e] = reader.delays.len();
+                    },
+                    _ => (),
+                }
+            }
+            StepsAndExpected { expected_counts, steps }
+        })
+        .boxed()
 }
 
 #[derive(Debug)]
@@ -32,7 +152,7 @@ fn whole_run() -> BoxedStrategy<WholeRun> {
     ((0..10usize), (0..25usize))
         .prop_flat_map(|(readers, sends)| {
             let delays = prop::collection::vec(delay(), sends);
-            let reader = delays.clone().prop_map(|delays| TestReader { delays });
+            let reader = delays.clone().prop_map(|delays| TestReader { id: 0, delays });
             let readers = prop::collection::vec(reader, readers);
             (readers, delays)
         })
@@ -40,8 +160,8 @@ fn whole_run() -> BoxedStrategy<WholeRun> {
         .boxed()
 }
 
-fn spawn_deadlined<F>(timeout: Duration, future: F)
-    where F: futures::Future + Send + 'static,
+fn spawn_deadlined<F>(timeout: Duration, shared: sync::Arc<Shared>, future: F)
+    where F: futures::Future<Error = ()> + Send + 'static,
 {
     use futures::Future;
     let deadline = Instant::now() + timeout;
@@ -49,109 +169,134 @@ fn spawn_deadlined<F>(timeout: Duration, future: F)
         tokio::timer::Deadline::new(future, deadline)
             .map(|_| ())
             .map_err(move |e| {
-                panic!("\ndeadline failure\ntimeout: {:?}\ndeadline elapsed: {:?}\ntimer error: {:?}\n",
+                eprintln!("\ndeadline failure\ntimeout: {:?}\ndeadline elapsed: {:?}\ntimer error: {:?}\n",
                     timeout, e.is_elapsed(), e.into_timer());
+                shared.fuse.store(true, sync::atomic::Ordering::Relaxed);
             })
     });
 }
 
+#[derive(Debug, Default)]
+struct Shared {
+    fuse: sync::atomic::AtomicBool,
+    items: sync::Mutex<Vec<SentItem>>,
+}
+
 proptest! {
     #[test]
-    fn it_delivers_all_messages_async(run in whole_run(), buffer in 1..15usize) {
-        let expected_items = run.readers
-            .first().as_ref().map(|r| r.delays.len())
-            .unwrap_or(0) * run.readers.len();
-        let max_delay_sum = run.readers.iter()
-            .map(|r| r.delays.iter())
-            .chain(std::iter::once(run.sender_delays.iter()))
-            .map(|i| i.sum::<Duration>())
-            .max().unwrap_or_else(|| Duration::from_millis(10));
-        let items = sync::Arc::new(sync::Mutex::new(vec![]));
-        let tokio_items = items.clone();
+    fn it_delivers_all_messages_async(steps in run_steps(), buffer in 1..15usize) {
+        let shared: sync::Arc<Shared> = Default::default();
+        let tokio_shared = shared.clone();
+        let StepsAndExpected { steps, expected_counts } = steps;
+        let started_at = Instant::now();
 
         tokio::run(future::lazy(move || {
-            let items = tokio_items;
-            let started_at = Instant::now();
-            let timeout = max_delay_sum * 2;
-            let mut bus = bus::Bus::new_async(buffer);
-
-            for (nr, reader) in run.readers.into_iter().enumerate() {
-                spawn_deadlined(timeout, {
-                    let items = items.clone();
-                    stream::iter_ok(reader.delays)
-                        .zip(bus.add_rx())
-                        .for_each(move |(delay, e)| {
-                            items.lock().unwrap().push((nr, e, started_at.elapsed()));
-                            tokio::timer::Delay::new(Instant::now() + delay)
-                                .map_err(|_: tokio::timer::Error| panic!("delay failed"))
-                        })
-                        .map_err(|_| unreachable!())
-                });
-            }
-
-            spawn_deadlined(timeout, {
-                stream::iter_ok::<_, ()>(run.sender_delays.into_iter().enumerate())
-                    .and_then(|(e, delay)| {
-                        tokio::timer::Delay::new(Instant::now() + delay)
-                            .map_err(|_: tokio::timer::Error| panic!("delay failed"))
-                            .map(move |()| e)
+            eprintln!("run start");
+            let shared = tokio_shared.clone();
+            spawn_deadlined(Duration::from_secs(10), shared.clone(), {
+                let shared = shared.clone();
+                stream::iter_ok(steps)
+                    .fold(bus::Bus::new_async(buffer), move |mut bus, step| -> Box<Future<Item = bus::Bus<_, _>, Error = _> + Send> {
+                        use RunStep::*;
+                        let now = Instant::now();
+                        eprintln!("current step: {:?} @{:?}", step, started_at.elapsed());
+                        match step {
+                            DoSend => Box::new({
+                                bus.send(now)
+                                    .map_err(|_| unreachable!())
+                            }),
+                            SpawnReader(reader) => Box::new({
+                                spawn_deadlined(
+                                    Duration::from_secs(10), shared.clone(),
+                                    reader.spawned(bus.add_rx(), shared.clone()));
+                                Ok(bus).into_future()
+                            }),
+                            Wait(delay) => Box::new({
+                                tokio::timer::Delay::new(now + delay)
+                                    .map(move |()| bus)
+                                    .map_err(|_: tokio::timer::Error| eprintln!("delay failed"))
+                            }),
+                        }
                     })
-                    .forward(bus.sink_map_err(|_| unreachable!()))
+                    .map(move |_| eprintln!("ran all the steps @{:?}", started_at.elapsed()))
             });
 
             Ok(())
         }));
 
-        let mut items = sync::Arc::try_unwrap(items).unwrap()
-            .into_inner().unwrap();
-        prop_assert_eq!(items.len(), expected_items);
+        let shared = sync::Arc::try_unwrap(shared)
+            .unwrap_or_else(|e| {
+                eprintln!("couldn't unwrap arc: {:?}", e);
+                panic!("arc still active");
+            });
+        let interrupted_run_time = if shared.fuse.into_inner() {
+            eprintln!("timed out");
+            Some(started_at.elapsed())
+        } else {
+            eprintln!("didn't time out");
+            None
+        };
+        let items = shared.items.into_inner().unwrap();
+        let mut actual_reads = vec![0; expected_counts.len()];
+        for item in items {
+            actual_reads[item.reader] += 1;
+        }
+        eprintln!("reads match: {:?}", actual_reads == expected_counts);
+        prop_assert_eq!((actual_reads, interrupted_run_time), (expected_counts, None));
     }
 
     #[test]
-    fn it_delivers_all_messages_sync(run in whole_run(), buffer in 1..15usize) {
-        let expected_items = run.readers
-            .first().as_ref().map(|r| r.delays.len())
-            .unwrap_or(0) * run.readers.len();
-        let max_delay_sum = run.readers.iter()
-            .map(|r| r.delays.iter())
-            .chain(std::iter::once(run.sender_delays.iter()))
-            .map(|i| i.sum::<Duration>())
-            .max().unwrap_or_else(|| Duration::from_millis(10));
-        let n_readers = run.readers.len();
-        let items = sync::Arc::new(sync::Mutex::new(vec![]));
+    fn it_delivers_all_messages_sync(steps in run_steps(), buffer in 1..15usize) {
+        let shared: sync::Arc<Shared> = Default::default();
+        let (threads_tx, threads_rx) = sync::mpsc::channel();
+        let StepsAndExpected { steps, expected_counts } = steps;
         let started_at = Instant::now();
-        let deadline = started_at + (max_delay_sum * 2);
         let mut bus = bus::Bus::new(buffer);
 
-        let mut threads = run.readers.into_iter()
-            .enumerate()
-            .map(|(nr, reader)| {
-                let mut rx = bus.add_rx();
-                let items = items.clone();
-                thread::spawn(move || {
-                    for delay in reader.delays {
-                        let e = rx.recv().unwrap();
-                        items.lock().unwrap().push((nr, e, started_at.elapsed()));
-                        thread::sleep(delay);
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let sender_delays = run.sender_delays;
-        threads.push(thread::spawn(move || {
-            for (e, delay) in sender_delays.into_iter().enumerate() {
-                bus.broadcast(e);
-                thread::sleep(delay);
+        let inner_shared = shared.clone();
+        let inner_threads_tx = threads_tx.clone();
+        let main_thread = thread::spawn(move || {
+            eprintln!("run start");
+            for step in steps {
+                use RunStep::*;
+                let now = Instant::now();
+                eprintln!("current step: {:?} @{:?}", step, started_at.elapsed());
+                match step {
+                    DoSend => bus.broadcast(now),
+                    SpawnReader(reader) => {
+                        let reader = reader.spawned_sync(bus.add_rx(), inner_shared.clone());
+                        inner_threads_tx.send(reader).unwrap();
+                    },
+                    Wait(delay) => thread::sleep(delay),
+                }
+                eprintln!("ran all the steps @{:?}", started_at.elapsed());
             }
-        }));
+        });
 
-        for thread in threads {
+        threads_tx.send(main_thread).unwrap();
+        drop(threads_tx);
+        for thread in threads_rx.iter() {
             thread.join().unwrap();
         }
 
-        let mut items = sync::Arc::try_unwrap(items).unwrap()
-            .into_inner().unwrap();
-        prop_assert_eq!(items.len(), expected_items);
+        let shared = sync::Arc::try_unwrap(shared)
+            .unwrap_or_else(|e| {
+                eprintln!("couldn't unwrap arc: {:?}", e);
+                panic!("arc still active");
+            });
+        let interrupted_run_time = if shared.fuse.into_inner() {
+            eprintln!("timed out");
+            Some(started_at.elapsed())
+        } else {
+            eprintln!("didn't time out");
+            None
+        };
+        let items = shared.items.into_inner().unwrap();
+        let mut actual_reads = vec![0; expected_counts.len()];
+        for item in items {
+            actual_reads[item.reader] += 1;
+        }
+        eprintln!("reads match: {:?}", actual_reads == expected_counts);
+        prop_assert_eq!((actual_reads, interrupted_run_time), (expected_counts, None));
     }
 }

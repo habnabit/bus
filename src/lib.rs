@@ -174,7 +174,7 @@ pub enum BlockOutcome {
 }
 
 /// TODO
-pub trait Parkable: Sized + Send + 'static {
+pub trait Parkable: Sized + Send + Clone + 'static {
     /// TODO
     type PreparkState;
 
@@ -299,7 +299,7 @@ impl<T: Clone + Sync, P: Parkable> Seat<T, P> {
             // we're the last reader, so we may need to notify the writer there's space in the buf.
             // can be relaxed, since the acquire at the top already guarantees that we'll see
             // updates.
-            waiting = self.waiting.take(atomic::Ordering::Relaxed);
+            waiting = self.waiting.take(atomic::Ordering::AcqRel);
 
             // since we're the last reader, no-one else will be cloning this value, so we can
             // safely take a mutable reference, and just take the val instead of cloning it.
@@ -310,6 +310,7 @@ impl<T: Clone + Sync, P: Parkable> Seat<T, P> {
                 .clone()
                 .expect("seat that should be occupied was empty")
         };
+        //let expl = format!("read {} state.max {}", read, state.max);
 
         // let writer know that we no longer need this item.
         // state is no longer safe to access.
@@ -317,6 +318,7 @@ impl<T: Clone + Sync, P: Parkable> Seat<T, P> {
         drop(state);
         self.read.fetch_add(1, atomic::Ordering::AcqRel);
 
+        //eprintln!("unparking writer: {:?} {}", waiting.is_some(), expl);
         if let Some(t) = waiting {
             // writer was waiting for us to finish with this
             t.unpark();
@@ -344,6 +346,7 @@ struct BusInner<T, P> {
     len: usize,
     tail: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
+    XXX_waiting_waker: AtomicOption<P>,
 }
 
 /// `Bus` is the main interconnect for broadcast messages. It can be used to send broadcast
@@ -416,6 +419,7 @@ impl<T, P: Parkable> Bus<T, P> {
             tail: atomic::AtomicUsize::new(0),
             closed: atomic::AtomicBool::new(false),
             len: len,
+            XXX_waiting_waker: AtomicOption::empty(),
         });
 
         Bus {
@@ -484,16 +488,22 @@ impl<T, P: Parkable> Bus<T, P> {
                 // yes! go ahead and write!
                 break;
             }
+
+            //eprintln!("about to park writer, but: fence_read {} expected {} second fence_read {}", fence_read, self.expected(fence), self.state.ring[fence].read.load(atomic::Ordering::Acquire));
             match P::maybe_park(&mut prepark, |current| {
                 // no, so block by parking and telling readers to notify on last read
                 self.state.ring[fence]
                     .waiting
+                    .replace(Some(Box::new(current.clone())), atomic::Ordering::Relaxed);
+                self.state.XXX_waiting_waker
                     .replace(Some(Box::new(current)), atomic::Ordering::Relaxed);
 
                 // need the atomic fetch_add to ensure reader threads will see the new .waiting
                 self.state.ring[fence]
                     .read
                     .fetch_add(0, atomic::Ordering::Release);
+
+                //eprintln!("parking writer");
             }) {
                 BlockOutcome::DidBlock => continue,
                 BlockOutcome::CannotBlock => return Err(val),
@@ -519,6 +529,7 @@ impl<T, P: Parkable> Bus<T, P> {
             state.max = readers;
             state.val = Some(val);
             next.waiting.replace(None, atomic::Ordering::Relaxed);
+            self.state.XXX_waiting_waker.replace(None, atomic::Ordering::Relaxed);
             next.read.store(0, atomic::Ordering::Release);
         }
         self.rleft[tail] = 0;
@@ -533,6 +544,7 @@ impl<T, P: Parkable> Bus<T, P> {
             if at == tail {
                 self.cache.push((t, at))
             } else {
+                //eprintln!("unparking reader");
                 t.unpark();
             }
         }
@@ -614,6 +626,7 @@ impl<T, P> Drop for Bus<T, P> {
         self.state.tail.fetch_add(0, atomic::Ordering::AcqRel);
         // TODO: unpark receivers -- this is not absolutely necessary, since the reader's park will
         // time out, but it would cause them to detect the closed bus somewhat faster.
+        //eprintln!("dropping writer");
     }
 }
 
@@ -641,7 +654,7 @@ impl<T, P> Drop for Bus<T, P> {
 /// drop(r2);
 /// assert_eq!(tx.try_broadcast(true), Ok(()));
 /// ```
-pub struct BusReader<T, P = thread::Thread> {
+pub struct BusReader<T, P: Parkable = thread::Thread> {
     bus: Arc<BusInner<T, P>>,
     head: usize,
     leaving: mpsc::Sender<usize>,
@@ -695,6 +708,7 @@ impl<T: Clone + Sync, P: Parkable> BusReader<T, P> {
                     }
                     first = false;
                 }
+                //eprintln!("parking reader");
             }) {
                 BlockOutcome::DidBlock => (),
                 BlockOutcome::CannotBlock => return Err(mpsc::RecvTimeoutError::Timeout),
@@ -812,12 +826,15 @@ impl<T: Clone + Sync> BusReader<T> {
     }
 }
 
-impl<T, P> Drop for BusReader<T, P> {
-    #[allow(unused_must_use)]
+impl<T, P: Parkable> Drop for BusReader<T, P> {
     fn drop(&mut self) {
         // we allow not checking the result here because the writer might have gone away, which
         // would result in an error, but is okay nonetheless.
-        self.leaving.send(self.head);
+        let _ = self.leaving.send(self.head);
+        if let Some(t) = self.bus.XXX_waiting_waker.take(atomic::Ordering::Acquire) {
+            t.unpark();
+        }
+        //eprintln!("dropping reader");
     }
 }
 
