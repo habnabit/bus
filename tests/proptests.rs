@@ -8,13 +8,20 @@ use futures::{future, stream};
 use futures::prelude::*;
 use proptest::prelude::*;
 use std::{iter, mem, sync, thread};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 
 fn delay() -> BoxedStrategy<Duration> {
-    (1..1250u64)
+    (1..125u64)
         .prop_map(Duration::from_millis)
         .boxed()
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExpectedReader {
+    delays: Vec<Duration>,
+    reads: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -31,7 +38,7 @@ struct SentItem {
 }
 
 impl TestReader {
-    fn spawned(self, bus_reader: bus::BusReader<Instant, futures::task::Task>, shared: sync::Arc<Shared>) -> impl Future<Item = (), Error = ()> {
+    fn spawned(self, bus_reader: bus::BusReader<Instant>, shared: sync::Arc<Shared>) -> impl Future<Item = (), Error = ()> {
         let reader = self.id;
         stream::iter_ok(self.delays)
             .zip(bus_reader)
@@ -48,23 +55,6 @@ impl TestReader {
                 Box::new(tokio::timer::Delay::new(received_at + delay))
             })
             .map_err(|e| eprintln!("timer failure"))
-    }
-
-    fn spawned_sync(self, bus_reader: bus::BusReader<Instant>, shared: sync::Arc<Shared>) -> thread::JoinHandle<()> {
-        let TestReader { id: reader, delays } = self;
-        thread::spawn(move || {
-            for (delay, sent_at) in delays.into_iter().zip(bus_reader) {
-                eprintln!("received item to {} from {:?}", reader, sent_at.elapsed());
-                if shared.fuse.load(sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                let received_at = Instant::now();
-                shared.items.lock().unwrap().push(SentItem {
-                    reader, sent_at, received_at,
-                });
-                thread::sleep(delay);
-            }
-        })
     }
 }
 
@@ -87,7 +77,7 @@ fn run_steps() -> BoxedStrategy<StepsAndExpected> {
         Just(RunStep::SpawnReader(TestReader { id: 0, delays: vec![] })),
         delay().prop_map(RunStep::Wait),
     ];
-    prop::collection::vec(step, 1..75)
+    prop::collection::vec(step, 1..25)
         .prop_flat_map(|mut steps| {
             let n_steps = steps.len();
             let mut possible_reads = vec![None; n_steps];
@@ -107,34 +97,36 @@ fn run_steps() -> BoxedStrategy<StepsAndExpected> {
                 }
             }
             let max_reads = possible_reads.iter().filter_map(|o| o.clone()).sum::<u32>() as usize;
-            let reader_delays = if max_reads > 0 {
+            let readers = if max_reads > 0 {
                 let read_indices = possible_reads.iter().enumerate()
-                    .flat_map(|(e, o)| iter::repeat(e).take(o.unwrap_or(0) as usize))
+                    .filter_map(|(e, o)| if o.unwrap_or(0) > 0 { Some(e) } else { None })
                     .collect::<Vec<_>>();
-                (Just(read_indices).prop_shuffle(), prop::collection::vec(delay(), ..max_reads))
-                    .prop_map(move |(mut indices, mut delays)| {
-                        let mut reader_delays = vec![vec![]; n_steps];
-                        while let (Some(idx), Some(delay)) = (indices.pop(), delays.pop()) {
-                            reader_delays[idx].push(delay);
+                prop::collection::vec((prop::sample::select(read_indices), delay()), ..(max_reads + 2))
+                    .prop_map(move |pairs| {
+                        let mut readers: BTreeMap<usize, ExpectedReader> = Default::default();
+                        for (idx, delay) in pairs {
+                            readers.entry(idx).or_insert_with(Default::default).delays.push(delay);
                         }
-                        reader_delays
+                        for (idx, expected) in readers.iter_mut() {
+                            expected.reads = expected.delays.len().min(possible_reads[*idx].unwrap_or(0) as usize);
+                        }
+                        readers
                     })
                     .boxed()
             } else {
-                Just(vec![vec![]; n_steps]).boxed()
+                Just(BTreeMap::new()).boxed()
             };
-            (reader_delays, Just(steps))
+            (readers, Just(steps))
         })
-        .prop_map(|(mut reader_delays, mut steps)| {
+        .prop_map(|(mut readers, mut steps)| {
             let mut expected_counts = vec![0; steps.len()];
             for (e, step) in steps.iter_mut().enumerate() {
                 use RunStep::*;
-                match step {
-                    SpawnReader(reader) => {
-                        reader.delays = mem::replace(&mut reader_delays[e], vec![]);
-                        expected_counts[e] = reader.delays.len();
-                    },
-                    _ => (),
+                if let SpawnReader(reader) = step {
+                    if let Some(expected) = readers.remove(&e) {
+                        reader.delays = expected.delays;
+                        expected_counts[e] = expected.reads;
+                    }
                 }
             }
             StepsAndExpected { expected_counts, steps }
@@ -182,6 +174,8 @@ struct Shared {
     items: sync::Mutex<Vec<SentItem>>,
 }
 
+const MAX_TEST_TIME: Duration = Duration::from_millis(7500);
+
 proptest! {
     #[test]
     fn it_delivers_all_messages_async(steps in run_steps(), buffer in 1..15usize) {
@@ -193,10 +187,10 @@ proptest! {
         tokio::run(future::lazy(move || {
             eprintln!("run start");
             let shared = tokio_shared.clone();
-            spawn_deadlined(Duration::from_secs(10), shared.clone(), {
+            spawn_deadlined(MAX_TEST_TIME, shared.clone(), {
                 let shared = shared.clone();
                 stream::iter_ok(steps)
-                    .fold(bus::Bus::new_async(buffer), move |mut bus, step| -> Box<Future<Item = bus::Bus<_, _>, Error = _> + Send> {
+                    .fold(bus::Bus::new(buffer), move |mut bus, step| -> Box<Future<Item = bus::Bus<_>, Error = _> + Send> {
                         use RunStep::*;
                         let now = Instant::now();
                         eprintln!("current step: {:?} @{:?}", step, started_at.elapsed());
@@ -207,7 +201,7 @@ proptest! {
                             }),
                             SpawnReader(reader) => Box::new({
                                 spawn_deadlined(
-                                    Duration::from_secs(10), shared.clone(),
+                                    MAX_TEST_TIME, shared.clone(),
                                     reader.spawned(bus.add_rx(), shared.clone()));
                                 Ok(bus).into_future()
                             }),
@@ -224,69 +218,15 @@ proptest! {
             Ok(())
         }));
 
+        let run_time = started_at.elapsed();
         let shared = sync::Arc::try_unwrap(shared)
             .unwrap_or_else(|e| {
                 eprintln!("couldn't unwrap arc: {:?}", e);
                 panic!("arc still active");
             });
-        let interrupted_run_time = if shared.fuse.into_inner() {
+        let interrupted_run_time = if shared.fuse.into_inner() || run_time > MAX_TEST_TIME {
             eprintln!("timed out");
-            Some(started_at.elapsed())
-        } else {
-            eprintln!("didn't time out");
-            None
-        };
-        let items = shared.items.into_inner().unwrap();
-        let mut actual_reads = vec![0; expected_counts.len()];
-        for item in items {
-            actual_reads[item.reader] += 1;
-        }
-        eprintln!("reads match: {:?}", actual_reads == expected_counts);
-        prop_assert_eq!((actual_reads, interrupted_run_time), (expected_counts, None));
-    }
-
-    #[test]
-    fn it_delivers_all_messages_sync(steps in run_steps(), buffer in 1..15usize) {
-        let shared: sync::Arc<Shared> = Default::default();
-        let (threads_tx, threads_rx) = sync::mpsc::channel();
-        let StepsAndExpected { steps, expected_counts } = steps;
-        let started_at = Instant::now();
-        let mut bus = bus::Bus::new(buffer);
-
-        let inner_shared = shared.clone();
-        let inner_threads_tx = threads_tx.clone();
-        let main_thread = thread::spawn(move || {
-            eprintln!("run start");
-            for step in steps {
-                use RunStep::*;
-                let now = Instant::now();
-                eprintln!("current step: {:?} @{:?}", step, started_at.elapsed());
-                match step {
-                    DoSend => bus.broadcast(now),
-                    SpawnReader(reader) => {
-                        let reader = reader.spawned_sync(bus.add_rx(), inner_shared.clone());
-                        inner_threads_tx.send(reader).unwrap();
-                    },
-                    Wait(delay) => thread::sleep(delay),
-                }
-                eprintln!("ran all the steps @{:?}", started_at.elapsed());
-            }
-        });
-
-        threads_tx.send(main_thread).unwrap();
-        drop(threads_tx);
-        for thread in threads_rx.iter() {
-            thread.join().unwrap();
-        }
-
-        let shared = sync::Arc::try_unwrap(shared)
-            .unwrap_or_else(|e| {
-                eprintln!("couldn't unwrap arc: {:?}", e);
-                panic!("arc still active");
-            });
-        let interrupted_run_time = if shared.fuse.into_inner() {
-            eprintln!("timed out");
-            Some(started_at.elapsed())
+            Some(run_time)
         } else {
             eprintln!("didn't time out");
             None

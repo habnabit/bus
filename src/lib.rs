@@ -117,27 +117,21 @@
 extern crate atomic_option;
 use atomic_option::AtomicOption;
 
-extern crate parking_lot_core;
-use parking_lot_core::SpinWait;
+extern crate futures;
+use futures::prelude::*;
+use futures::sync::mpsc;
+use futures::task;
+
+extern crate void;
 
 #[cfg(feature = "bench")]
 extern crate test;
 
-#[cfg(feature = "async")]
-extern crate futures;
-#[cfg(feature = "async")]
-extern crate void;
-
 use std::sync::atomic;
-use std::sync::mpsc;
-use std::thread;
-use std::time;
 
 use std::cell::UnsafeCell;
 use std::ops::Deref;
 use std::sync::Arc;
-
-const SPINTIME: u32 = 100_000; //ns
 
 struct SeatState<T> {
     max: usize,
@@ -150,90 +144,6 @@ impl<T> Deref for MutSeatState<T> {
     type Target = UnsafeCell<SeatState<T>>;
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-/// TODO
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BlockCondition {
-    /// TODO
-    Try,
-    /// TODO
-    Block,
-    /// TOTO
-    Timeout(time::Duration),
-}
-
-/// TODO
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BlockOutcome {
-    /// TODO
-    DidBlock,
-    /// TODO
-    CannotBlock,
-}
-
-/// TODO
-pub trait Parkable: Sized + Send + Clone + 'static {
-    /// TODO
-    type PreparkState;
-
-    /// TODO
-    fn current() -> Self;
-
-    /// TODO
-    fn unpark(&self);
-
-    /// TODO
-    fn prepare(block: BlockCondition) -> Self::PreparkState;
-
-    /// TODO
-    fn maybe_park<F>(state: &mut Self::PreparkState, store_parked: F) -> BlockOutcome
-        where F: FnOnce(Self);
-}
-
-impl Parkable for thread::Thread {
-    type PreparkState = (BlockCondition, SpinWait, time::Instant);
-    fn current() -> Self { thread::current() }
-    fn unpark(&self) { thread::Thread::unpark(self) }
-
-    fn prepare(block: BlockCondition) -> Self::PreparkState {
-        (block, SpinWait::new(), time::Instant::now())
-    }
-
-    fn maybe_park<F>(state: &mut Self::PreparkState, store_parked: F) -> BlockOutcome
-        where F: FnOnce(Self),
-    {
-        let (block, sw, start) = state;
-        if *block == BlockCondition::Try {
-            return BlockOutcome::CannotBlock;
-        }
-        store_parked(Self::current());
-        let spintime = time::Duration::new(0, SPINTIME);
-        if sw.spin() { return BlockOutcome::DidBlock; }
-        match *block {
-            BlockCondition::Timeout(t) => {
-                match t.checked_sub(start.elapsed()) {
-                    Some(left) => {
-                        if left < spintime {
-                            thread::park_timeout(left);
-                        } else {
-                            thread::park_timeout(spintime);
-                        }
-                    }
-                    None => {
-                        // So, the wake-up thread is still going to try to wake us up later
-                        // since we sent thread::current() above, but that's fine.
-                        return BlockOutcome::CannotBlock;
-                    }
-                }
-            }
-            BlockCondition::Block => {
-                thread::park_timeout(spintime);
-            }
-            BlockCondition::Try => unreachable!(),
-        }
-        BlockOutcome::DidBlock
     }
 }
 
@@ -250,16 +160,16 @@ impl Parkable for thread::Thread {
 ///
 /// The `read` attribute is used to ensure that readers see the most recent write to the seat when
 /// they access it. This is done using `atomic::Ordering::Acquire` and `atomic::Ordering::Release`.
-struct Seat<T, P> {
+struct Seat<T> {
     read: atomic::AtomicUsize,
     state: MutSeatState<T>,
 
     // is the writer waiting for this seat to be emptied? needs to be atomic since both the last
     // reader and the writer might be accessing it at the same time.
-    waiting: AtomicOption<P>,
+    waiting: AtomicOption<task::Task>,
 }
 
-impl<T: Clone + Sync, P: Parkable> Seat<T, P> {
+impl<T: Clone + Sync> Seat<T> {
     /// take is used by a reader to extract a copy of the value stored on this seat. only readers
     /// that were created strictly before the time this seat was last written to by the producer
     /// are allowed to call this method, and they may each only call it once.
@@ -299,7 +209,7 @@ impl<T: Clone + Sync, P: Parkable> Seat<T, P> {
             // we're the last reader, so we may need to notify the writer there's space in the buf.
             // can be relaxed, since the acquire at the top already guarantees that we'll see
             // updates.
-            waiting = self.waiting.take(atomic::Ordering::AcqRel);
+            waiting = self.waiting.take(atomic::Ordering::Relaxed);
 
             // since we're the last reader, no-one else will be cloning this value, so we can
             // safely take a mutable reference, and just take the val instead of cloning it.
@@ -310,7 +220,6 @@ impl<T: Clone + Sync, P: Parkable> Seat<T, P> {
                 .clone()
                 .expect("seat that should be occupied was empty")
         };
-        //let expl = format!("read {} state.max {}", read, state.max);
 
         // let writer know that we no longer need this item.
         // state is no longer safe to access.
@@ -318,17 +227,16 @@ impl<T: Clone + Sync, P: Parkable> Seat<T, P> {
         drop(state);
         self.read.fetch_add(1, atomic::Ordering::AcqRel);
 
-        //eprintln!("unparking writer: {:?} {}", waiting.is_some(), expl);
         if let Some(t) = waiting {
             // writer was waiting for us to finish with this
-            t.unpark();
+            t.notify();
         }
 
         v
     }
 }
 
-impl<T, P> Default for Seat<T, P> {
+impl<T> Default for Seat<T> {
     fn default() -> Self {
         Seat {
             read: atomic::AtomicUsize::new(0),
@@ -341,12 +249,34 @@ impl<T, P> Default for Seat<T, P> {
 /// `BusInner` encapsulates data that both the writer and the readers need to access. The tail is
 /// only ever modified by the producer, and read by the consumers. The length of the bus is
 /// instantiated when the bus is created, and is never modified.
-struct BusInner<T, P> {
-    ring: Vec<Seat<T, P>>,
+struct BusInner<T> {
+    ring: Vec<Seat<T>>,
     len: usize,
     tail: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
-    XXX_waiting_waker: AtomicOption<P>,
+}
+
+struct WaitingReader {
+    task: Option<task::Task>,
+    at: usize,
+}
+
+impl WaitingReader {
+    fn current(at: usize) -> Self {
+        WaitingReader { task: Some(task::current()), at }
+    }
+
+    fn notify(&mut self) {
+        if let Some(t) = self.task.take() {
+            t.notify()
+        }
+    }
+}
+
+impl Drop for WaitingReader {
+    fn drop(&mut self) {
+        self.notify()
+    }
 }
 
 /// `Bus` is the main interconnect for broadcast messages. It can be used to send broadcast
@@ -354,8 +284,8 @@ struct BusInner<T, P> {
 /// continue receiving any outstanding broadcast messages they would have received if the bus were
 /// not dropped. After all those messages have been received, any subsequent receive call on a
 /// receiver will return a disconnected error.
-pub struct Bus<T, P = thread::Thread> {
-    state: Arc<BusInner<T, P>>,
+pub struct Bus<T> {
+    state: Arc<BusInner<T>>,
 
     // current number of readers
     readers: usize,
@@ -365,50 +295,42 @@ pub struct Bus<T, P = thread::Thread> {
     rleft: Vec<usize>,
 
     // leaving is used by receivers to signal that they are done
-    leaving: (mpsc::Sender<usize>, mpsc::Receiver<usize>),
+    leaving: (mpsc::UnboundedSender<usize>, mpsc::UnboundedReceiver<usize>),
 
     // waiting is used by receivers to signal that they are waiting for new entries, and where they
     // are waiting
-    #[cfg_attr(feature = "cargo-clippy", allow(type_complexity))]
     waiting: (
-        mpsc::Sender<(P, usize)>,
-        mpsc::Receiver<(P, usize)>,
+        mpsc::UnboundedSender<WaitingReader>,
+        mpsc::UnboundedReceiver<WaitingReader>,
     ),
 
     // cache used to keep track of threads waiting for next write.
     // this is only here to avoid allocating one on every broadcast()
-    cache: Vec<(P, usize)>,
+    cache: Vec<WaitingReader>,
 }
 
-impl<T> Bus<T, thread::Thread> {
-    /// TODO forwards to with_parkable
-    pub fn new(len: usize) -> Self {
-        Bus::with_parkable(len)
-    }
+struct UnboundedReceiverIterator<'a, T: 'a>(&'a mut mpsc::UnboundedReceiver<T>);
 
-    /// Broadcasts a value on the bus to all consumers.
-    ///
-    /// This function will block until space in the internal buffer becomes available.
-    ///
-    /// Note that a successful send does not guarantee that the receiver will ever see the data if
-    /// there is a buffer on this channel. Items may be enqueued in the internal buffer for the
-    /// receiver to receive at a later time. Furthermore, in contrast to regular channels, a bus is
-    /// *not* considered closed if there are no consumers, and thus broadcasts will continue to
-    /// succeed.
-    pub fn broadcast(&mut self, val: T) {
-        if let Err(..) = self.broadcast_inner(val, <thread::Thread as Parkable>::prepare(BlockCondition::Block)) {
-            unreachable!("blocking broadcast_inner can't fail");
+impl<'a, T> Iterator for UnboundedReceiverIterator<'a, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        match self.0.poll() {
+            Ok(Async::Ready(Some(x))) => Some(x),
+            Ok(Async::Ready(None)) |
+            Ok(Async::NotReady) => None,
+            Err(..) => unreachable!(),
         }
     }
 }
 
-impl<T, P: Parkable> Bus<T, P> {
+impl<T> Bus<T> {
     /// Allocates a new `Bus`.
     ///
     /// The provided length should be sufficient to absorb temporary peaks in the data flow, and is
     /// thus workflow-dependent. Bus performance degrades somewhat when the queue is full, so it is
     /// generally better to set this high than low unless you are pressed for memory.
-    pub fn with_parkable(mut len: usize) -> Self {
+    pub fn new(mut len: usize) -> Bus<T> {
         use std::iter;
 
         // ring buffer must have room for one padding element
@@ -419,15 +341,14 @@ impl<T, P: Parkable> Bus<T, P> {
             tail: atomic::AtomicUsize::new(0),
             closed: atomic::AtomicBool::new(false),
             len: len,
-            XXX_waiting_waker: AtomicOption::empty(),
         });
 
         Bus {
             state: inner,
             readers: 0,
             rleft: iter::repeat(0).take(len).collect(),
-            leaving: mpsc::channel(),
-            waiting: mpsc::channel(),
+            leaving: mpsc::unbounded(),
+            waiting: mpsc::unbounded(),
 
             cache: Vec::new(),
         }
@@ -451,7 +372,7 @@ impl<T, P: Parkable> Bus<T, P> {
     /// again, and the broadcast will be tried again until it succeeds.
     ///
     /// Note that broadcasts will succeed even if there are no consumers!
-    fn broadcast_inner(&mut self, val: T, mut prepark: P::PreparkState) -> Result<(), T> {
+    fn broadcast_inner(&mut self, val: T) -> Result<(), T> {
         let tail = self.state.tail.load(atomic::Ordering::Relaxed);
 
         // we want to check if the next element over is free to ensure that we always leave one
@@ -462,16 +383,11 @@ impl<T, P: Parkable> Bus<T, P> {
         let fence = (tail + 1) % self.state.len;
 
         loop {
-            let fence_read = self.state.ring[fence].read.load(atomic::Ordering::Acquire);
-
-            // is there room left in the ring?
-            if fence_read == self.expected(fence) {
-                break;
-            }
+            // async note: this .poll() must always happen, or the writer won't be woken on a reader leaving
 
             // no!
             // let's check if any readers have left, which might increment self.rleft[tail].
-            while let Ok(mut left) = self.leaving.1.try_recv() {
+            for mut left in UnboundedReceiverIterator(&mut self.leaving.1) {
                 // a reader has left! this means that every seat between `left` and `tail-1`
                 // has max set one too high. we track the number of such "missing" reads that
                 // should be ignored in self.rleft, and compensate for them when looking at
@@ -483,30 +399,25 @@ impl<T, P: Parkable> Bus<T, P> {
                 }
             }
 
+            let fence_read = self.state.ring[fence].read.load(atomic::Ordering::Acquire);
             // is the fence block now free?
             if fence_read == self.expected(fence) {
                 // yes! go ahead and write!
                 break;
-            }
-
-            //eprintln!("about to park writer, but: fence_read {} expected {} second fence_read {}", fence_read, self.expected(fence), self.state.ring[fence].read.load(atomic::Ordering::Acquire));
-            match P::maybe_park(&mut prepark, |current| {
+            } else {
                 // no, so block by parking and telling readers to notify on last read
                 self.state.ring[fence]
                     .waiting
-                    .replace(Some(Box::new(current.clone())), atomic::Ordering::Relaxed);
-                self.state.XXX_waiting_waker
-                    .replace(Some(Box::new(current)), atomic::Ordering::Relaxed);
+                    .replace(Some(Box::new(task::current())), atomic::Ordering::Relaxed);
 
                 // need the atomic fetch_add to ensure reader threads will see the new .waiting
                 self.state.ring[fence]
                     .read
                     .fetch_add(0, atomic::Ordering::Release);
 
-                //eprintln!("parking writer");
-            }) {
-                BlockOutcome::DidBlock => continue,
-                BlockOutcome::CannotBlock => return Err(val),
+                self.poll_waiting(tail);
+                // no, and blocking isn't allowed, so return an error
+                return Err(val);
             }
         }
 
@@ -529,7 +440,6 @@ impl<T, P: Parkable> Bus<T, P> {
             state.max = readers;
             state.val = Some(val);
             next.waiting.replace(None, atomic::Ordering::Relaxed);
-            self.state.XXX_waiting_waker.replace(None, atomic::Ordering::Relaxed);
             next.read.store(0, atomic::Ordering::Release);
         }
         self.rleft[tail] = 0;
@@ -537,46 +447,27 @@ impl<T, P: Parkable> Bus<T, P> {
         let tail = (tail + 1) % self.state.len;
         self.state.tail.store(tail, atomic::Ordering::Release);
 
+        self.poll_waiting(tail);
+        Ok(())
+    }
+
+    fn poll_waiting(&mut self, tail: usize) {
         // unblock any blocked receivers
-        while let Ok((t, at)) = self.waiting.1.try_recv() {
+        for waiting in UnboundedReceiverIterator(&mut self.waiting.1) {
             // the only readers we can't unblock are those that have already absorbed the
             // broadcast we just made, since they are blocking on the *next* broadcast
-            if at == tail {
-                self.cache.push((t, at))
+            if waiting.at == tail {
+                self.cache.push(waiting);
             } else {
-                //eprintln!("unparking reader");
-                t.unpark();
+                // async note: dropping the WaitingReader notifies its task
+                drop(waiting);
             }
         }
         for w in self.cache.drain(..) {
             // fine to do here because it is guaranteed not to block
-            self.waiting.0.send(w).unwrap();
+            // async note: self.waiting.1 is still open, so this can't fail
+            self.waiting.0.unbounded_send(w).unwrap();
         }
-
-        Ok(())
-    }
-
-    /// Attempt to broadcast the given value to all consumers, but does not block if full.
-    ///
-    /// Note that, in contrast to regular channels, a bus is *not* considered closed if there are
-    /// no consumers, and thus broadcasts will continue to succeed. Thus, a successful broadcast
-    /// occurs as long as there is room on the internal bus to store the value, or some older value
-    /// has been received by all consumers. Note that a return value of `Err` means that the data
-    /// will never be received (by any consumer), but a return value of Ok does not mean that the
-    /// data will be received by a given consumer. It is possible for a receiver to hang up
-    /// immediately after this function returns Ok.
-    ///
-    /// This method will never block the current thread.
-    ///
-    /// ```rust
-    /// use bus::Bus;
-    /// let mut tx = Bus::new(1);
-    /// let mut rx = tx.add_rx();
-    /// assert_eq!(tx.try_broadcast("Hello"), Ok(()));
-    /// assert_eq!(tx.try_broadcast("world"), Err("world"));
-    /// ```
-    pub fn try_broadcast(&mut self, val: T) -> Result<(), T> {
-        self.broadcast_inner(val, P::prepare(BlockCondition::Try))
     }
 
     /// Add a new consumer to this bus.
@@ -606,7 +497,7 @@ impl<T, P: Parkable> Bus<T, P> {
     /// assert_eq!(rx1.recv(), Ok("world"));
     /// assert_eq!(rx2.recv(), Ok("world"));
     /// ```
-    pub fn add_rx(&mut self) -> BusReader<T, P> {
+    pub fn add_rx(&mut self) -> BusReader<T> {
         self.readers += 1;
 
         BusReader {
@@ -619,14 +510,24 @@ impl<T, P: Parkable> Bus<T, P> {
     }
 }
 
-impl<T, P> Drop for Bus<T, P> {
+impl<T> Drop for Bus<T> {
     fn drop(&mut self) {
         self.state.closed.store(true, atomic::Ordering::Relaxed);
         // Acquire/Release .tail to ensure other threads see new .closed
         self.state.tail.fetch_add(0, atomic::Ordering::AcqRel);
-        // TODO: unpark receivers -- this is not absolutely necessary, since the reader's park will
-        // time out, but it would cause them to detect the closed bus somewhat faster.
-        //eprintln!("dropping writer");
+
+        self.waiting.1.close();
+        loop {
+            match self.waiting.1.poll() {
+                Ok(Async::Ready(Some(_))) => (),
+                Ok(Async::Ready(None)) => break,
+                Ok(Async::NotReady) => {
+                    eprintln!("!! yielding !!");
+                    std::thread::yield_now();
+                },
+                Err(..) => unreachable!(),
+            }
+        }
     }
 }
 
@@ -654,28 +555,27 @@ impl<T, P> Drop for Bus<T, P> {
 /// drop(r2);
 /// assert_eq!(tx.try_broadcast(true), Ok(()));
 /// ```
-pub struct BusReader<T, P: Parkable = thread::Thread> {
-    bus: Arc<BusInner<T, P>>,
+pub struct BusReader<T> {
+    bus: Arc<BusInner<T>>,
     head: usize,
-    leaving: mpsc::Sender<usize>,
-    waiting: mpsc::Sender<(P, usize)>,
+    leaving: mpsc::UnboundedSender<usize>,
+    waiting: mpsc::UnboundedSender<WaitingReader>,
     closed: bool,
 }
 
-impl<T: Clone + Sync, P: Parkable> BusReader<T, P> {
+impl<T: Clone + Sync> BusReader<T> {
     /// Attempts to read a broadcast from the bus.
     ///
     /// If the bus is empty, the behavior depends on `block`. If false,
     /// `Err(mpsc::RecvTimeoutError::Timeout)` is returned. Otherwise, the current thread will be
     /// parked until there is another broadcast on the bus, at which point the receive will be
     /// performed.
-    fn recv_inner(&mut self, mut prepark: P::PreparkState) -> Result<T, mpsc::RecvTimeoutError> {
+    fn recv_inner(&mut self) -> Poll<Option<T>, void::Void> {
         if self.closed {
-            return Err(mpsc::RecvTimeoutError::Disconnected);
+            return Ok(Async::Ready(None));
         }
 
         let mut was_closed = false;
-        let mut first = true;
         loop {
             let tail = self.bus.tail.load(atomic::Ordering::Acquire);
             if tail != self.head {
@@ -695,24 +595,12 @@ impl<T: Clone + Sync, P: Parkable> BusReader<T, P> {
 
                 // the bus is closed, and we didn't miss anything!
                 self.closed = true;
-                return Err(mpsc::RecvTimeoutError::Disconnected);
+                return Ok(Async::Ready(None));
             }
 
-            match P::maybe_park(&mut prepark, |current| {
-                // park and tell writer to notify on write
-                if first {
-                    if let Err(..) = self.waiting.send((current, self.head)) {
-                        // writer has gone away, but this is not a reliable way to check
-                        // in particular, we may also have missed updates
-                        unimplemented!();
-                    }
-                    first = false;
-                }
-                //eprintln!("parking reader");
-            }) {
-                BlockOutcome::DidBlock => (),
-                BlockOutcome::CannotBlock => return Err(mpsc::RecvTimeoutError::Timeout),
-            }
+            // async note: WaitingReader's Drop guarantees that if the writer has gone away, or is about to go away, this task will be notified again to drain itself.
+            let _ = self.waiting.unbounded_send(WaitingReader::current(self.head));
+            return Ok(Async::NotReady);
         }
 
         let head = self.head;
@@ -720,220 +608,40 @@ impl<T: Clone + Sync, P: Parkable> BusReader<T, P> {
 
         // safe because len is read-only
         self.head = (head + 1) % self.bus.len;
-        Ok(ret)
-    }
-
-    /// Attempts to return a pending broadcast on this receiver without blocking.
-    ///
-    /// This method will never block the caller in order to wait for data to become available.
-    /// Instead, this will always return immediately with a possible option of pending data on the
-    /// channel.
-    ///
-    /// If the corresponding bus has been dropped, and all broadcasts have been received, this
-    /// method will return with a disconnected error.
-    ///
-    /// This mehtod is useful for a flavor of "optimistic check" before deciding to block on a
-    /// receiver.
-    ///
-    /// ```rust
-    /// use bus::Bus;
-    /// use std::thread;
-    ///
-    /// let mut tx = Bus::new(10);
-    /// let mut rx = tx.add_rx();
-    ///
-    /// // spawn a thread that will broadcast at some point
-    /// let j = thread::spawn(move || {
-    ///     tx.broadcast(true);
-    /// });
-    ///
-    /// loop {
-    ///     match rx.try_recv() {
-    ///         Ok(val) => {
-    ///             assert_eq!(val, true);
-    ///             break;
-    ///         }
-    ///         Err(..) => {
-    ///             // maybe we can do other useful work here
-    ///             // or we can just busy-loop
-    ///             thread::yield_now()
-    ///         },
-    ///     }
-    /// }
-    ///
-    /// j.join().unwrap();
-    /// ```
-    pub fn try_recv(&mut self) -> Result<T, mpsc::TryRecvError> {
-        self.recv_inner(P::prepare(BlockCondition::Try)).map_err(|e| match e {
-            mpsc::RecvTimeoutError::Disconnected => mpsc::TryRecvError::Disconnected,
-            mpsc::RecvTimeoutError::Timeout => mpsc::TryRecvError::Empty,
-        })
+        Ok(Async::Ready(Some(ret)))
     }
 }
 
-impl<T: Clone + Sync> BusReader<T> {
-    /// Read another broadcast message from the bus, and block if none are available.
-    ///
-    /// This function will always block the current thread if there is no data available and it's
-    /// possible for more broadcasts to be sent. Once a broadcast is sent on the corresponding
-    /// `Bus`, then this receiver will wake up and return that message.
-    ///
-    /// If the corresponding `Bus` has been dropped, or it is dropped while this call is blocking,
-    /// this call will wake up and return `Err` to indicate that no more messages can ever be
-    /// received on this channel. However, since channels are buffered, messages sent before the
-    /// disconnect will still be properly received.
-    pub fn recv(&mut self) -> Result<T, mpsc::RecvError> {
-        match self.recv_inner(<thread::Thread as Parkable>::prepare(BlockCondition::Block)) {
-            Ok(val) => Ok(val),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
-            _ => unreachable!("blocking recv_inner can't fail"),
-        }
-    }
-
-    /// Attempts to wait for a value from the bus, returning an error if the corresponding channel
-    /// has hung up, or if it waits more than `timeout`.
-    ///
-    /// This function will always block the current thread if there is no data available and it's
-    /// possible for more broadcasts to be sent. Once a message is sent on the corresponding `Bus`,
-    /// then this receiver will wake up and return that message.
-    ///
-    /// If the corresponding `Bus` has been dropped, or it is dropped while this call is blocking,
-    /// this call will wake up and return Err to indicate that no more messages can ever be
-    /// received on this channel. However, since channels are buffered, messages sent before the
-    /// disconnect will still be properly received.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use bus::Bus;
-    /// use std::sync::mpsc::RecvTimeoutError;
-    /// use std::time::Duration;
-    ///
-    /// let mut tx = Bus::<bool>::new(10);
-    /// let mut rx = tx.add_rx();
-    ///
-    /// let timeout = Duration::from_millis(100);
-    /// assert_eq!(Err(RecvTimeoutError::Timeout), rx.recv_timeout(timeout));
-    /// ```
-    pub fn recv_timeout(&mut self, timeout: time::Duration) -> Result<T, mpsc::RecvTimeoutError> {
-        self.recv_inner(<thread::Thread as Parkable>::prepare(BlockCondition::Timeout(timeout)))
-    }
-
-    /// Returns an iterator that will block waiting for broadcasts. It will return `None` when the
-    /// bus has been closed (i.e., the `Bus` has been dropped).
-    pub fn iter(&mut self) -> BusIter<T> {
-        BusIter(self)
-    }
-}
-
-impl<T, P: Parkable> Drop for BusReader<T, P> {
+impl<T> Drop for BusReader<T> {
     fn drop(&mut self) {
         // we allow not checking the result here because the writer might have gone away, which
         // would result in an error, but is okay nonetheless.
-        let _ = self.leaving.send(self.head);
-        if let Some(t) = self.bus.XXX_waiting_waker.take(atomic::Ordering::Acquire) {
-            t.unpark();
-        }
-        //eprintln!("dropping reader");
+        let _ = self.leaving.unbounded_send(self.head);
     }
 }
 
-/// An iterator over messages on a receiver. This iterator will block whenever `next` is called,
-/// waiting for a new message, and `None` will be returned when the corresponding channel has been
-/// closed.
-pub struct BusIter<'a, T: 'a>(&'a mut BusReader<T>);
+impl<T: Clone + Sync> Sink for Bus<T> {
+    type SinkItem = T;
+    type SinkError = void::Void;
 
-/// An owning iterator over messages on a receiver. This iterator will block whenever `next` is
-/// called, waiting for a new message, and `None` will be returned when the corresponding bus has
-/// been closed.
-pub struct BusIntoIter<T>(BusReader<T>);
+    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+        match self.broadcast_inner(item) {
+            Ok(()) => Ok(AsyncSink::Ready),
+            Err(item) => Ok(AsyncSink::NotReady(item)),
+        }
+    }
 
-impl<'a, T: Clone + Sync> IntoIterator for &'a mut BusReader<T> {
+    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+        Ok(Async::Ready(()))
+    }
+}
+
+impl<T: Clone + Sync> Stream for BusReader<T> {
     type Item = T;
-    type IntoIter = BusIter<'a, T>;
-    fn into_iter(self) -> BusIter<'a, T> {
-        BusIter(self)
-    }
-}
+    type Error = void::Void;
 
-impl<T: Clone + Sync> IntoIterator for BusReader<T> {
-    type Item = T;
-    type IntoIter = BusIntoIter<T>;
-    fn into_iter(self) -> BusIntoIter<T> {
-        BusIntoIter(self)
-    }
-}
-
-impl<'a, T: Clone + Sync> Iterator for BusIter<'a, T> {
-    type Item = T;
-    fn next(&mut self) -> Option<T> {
-        self.0.recv().ok()
-    }
-}
-
-impl<T: Clone + Sync> Iterator for BusIntoIter<T> {
-    type Item = T;
-    fn next(&mut self) -> Option<T> {
-        self.0.recv().ok()
-    }
-}
-
-#[cfg(feature = "async")]
-mod async_impls {
-    use futures::prelude::*;
-    use futures::task;
-    use std::sync::mpsc;
-    use void;
-
-    use super::{BlockCondition, BlockOutcome, Bus, BusReader, Parkable};
-
-    impl Parkable for task::Task {
-        type PreparkState = ();
-        fn current() -> Self { task::current() }
-        fn unpark(&self) { task::Task::notify(self) }
-        fn prepare(block: BlockCondition) { assert_eq!(block, BlockCondition::Try); }
-        fn maybe_park<F>(_: &mut Self::PreparkState, store_parked: F) -> BlockOutcome
-            where F: FnOnce(Self),
-        {
-            store_parked(Self::current());
-            BlockOutcome::CannotBlock
-        }
-    }
-
-    impl<T> Bus<T, task::Task> {
-        /// TODO forwards to with_parkable
-        pub fn new_async(len: usize) -> Self {
-            Bus::with_parkable(len)
-        }
-    }
-
-    impl<T: Clone + Sync> Sink for Bus<T, task::Task> {
-        type SinkItem = T;
-        type SinkError = void::Void;
-
-        fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-            match self.try_broadcast(item) {
-                Ok(()) => Ok(AsyncSink::Ready),
-                Err(item) => Ok(AsyncSink::NotReady(item)),
-            }
-        }
-
-        fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-            Ok(Async::Ready(()))
-        }
-    }
-
-    impl<T: Clone + Sync> Stream for BusReader<T, task::Task> {
-        type Item = T;
-        type Error = void::Void;
-
-        fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-            match self.try_recv() {
-                Ok(value) => Ok(Async::Ready(Some(value))),
-                Err(mpsc::TryRecvError::Disconnected) => Ok(Async::Ready(None)),
-                Err(mpsc::TryRecvError::Empty) => Ok(Async::NotReady),
-            }
-        }
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        self.recv_inner()
     }
 }
 
