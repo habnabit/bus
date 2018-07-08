@@ -1,13 +1,18 @@
 extern crate bus;
 extern crate futures;
+
+#[macro_use]
+extern crate log;
+
 #[macro_use]
 extern crate proptest;
+
 extern crate tokio;
 
 use futures::{future, stream};
 use futures::prelude::*;
 use proptest::prelude::*;
-use std::{iter, mem, sync, thread};
+use std::sync;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -44,7 +49,7 @@ impl TestReader {
             .zip(bus_reader)
             .map_err(|_| unreachable!())
             .for_each(move |(delay, sent_at)| -> Box<Future<Item = (), Error = tokio::timer::Error> + Send> {
-                eprintln!("received item to {} from {:?}", reader, sent_at.elapsed());
+                info!("received item to {} from {:?}", reader, sent_at.elapsed());
                 if shared.fuse.load(sync::atomic::Ordering::Relaxed) {
                     return Box::new(future::err(tokio::timer::Error::shutdown()));
                 }
@@ -54,7 +59,7 @@ impl TestReader {
                 });
                 Box::new(tokio::timer::Delay::new(received_at + delay))
             })
-            .map_err(|e| eprintln!("timer failure"))
+            .map_err(|e| info!("timer failure {:?}", e))
     }
 }
 
@@ -134,24 +139,6 @@ fn run_steps() -> BoxedStrategy<StepsAndExpected> {
         .boxed()
 }
 
-#[derive(Debug)]
-struct WholeRun {
-    readers: Vec<TestReader>,
-    sender_delays: Vec<Duration>,
-}
-
-fn whole_run() -> BoxedStrategy<WholeRun> {
-    ((0..10usize), (0..25usize))
-        .prop_flat_map(|(readers, sends)| {
-            let delays = prop::collection::vec(delay(), sends);
-            let reader = delays.clone().prop_map(|delays| TestReader { id: 0, delays });
-            let readers = prop::collection::vec(reader, readers);
-            (readers, delays)
-        })
-        .prop_map(|(readers, sender_delays)| WholeRun { readers, sender_delays })
-        .boxed()
-}
-
 fn spawn_deadlined<F>(timeout: Duration, shared: sync::Arc<Shared>, future: F)
     where F: futures::Future<Error = ()> + Send + 'static,
 {
@@ -161,7 +148,7 @@ fn spawn_deadlined<F>(timeout: Duration, shared: sync::Arc<Shared>, future: F)
         tokio::timer::Deadline::new(future, deadline)
             .map(|_| ())
             .map_err(move |e| {
-                eprintln!("\ndeadline failure\ntimeout: {:?}\ndeadline elapsed: {:?}\ntimer error: {:?}\n",
+                info!("\ndeadline failure\ntimeout: {:?}\ndeadline elapsed: {:?}\ntimer error: {:?}\n",
                     timeout, e.is_elapsed(), e.into_timer());
                 shared.fuse.store(true, sync::atomic::Ordering::Relaxed);
             })
@@ -185,7 +172,7 @@ proptest! {
         let started_at = Instant::now();
 
         tokio::run(future::lazy(move || {
-            eprintln!("run start");
+            info!("run start");
             let shared = tokio_shared.clone();
             spawn_deadlined(MAX_TEST_TIME, shared.clone(), {
                 let shared = shared.clone();
@@ -193,7 +180,7 @@ proptest! {
                     .fold(bus::Bus::new(buffer), move |mut bus, step| -> Box<Future<Item = bus::Bus<_>, Error = _> + Send> {
                         use RunStep::*;
                         let now = Instant::now();
-                        eprintln!("current step: {:?} @{:?}", step, started_at.elapsed());
+                        info!("current step: {:?} @{:?}", step, started_at.elapsed());
                         match step {
                             DoSend => Box::new({
                                 bus.send(now)
@@ -208,11 +195,16 @@ proptest! {
                             Wait(delay) => Box::new({
                                 tokio::timer::Delay::new(now + delay)
                                     .map(move |()| bus)
-                                    .map_err(|_: tokio::timer::Error| eprintln!("delay failed"))
+                                    .map_err(|_: tokio::timer::Error| info!("delay failed"))
                             }),
                         }
                     })
-                    .map(move |_| eprintln!("ran all the steps @{:?}", started_at.elapsed()))
+                    .and_then(move |mut bus| {
+                        info!("ran all the steps @{:?}", started_at.elapsed());
+                        future::poll_fn(move || bus.close())
+                            .map_err(|_| unreachable!())
+                    })
+                    .map(move |()| info!("bus closed @{:?}", started_at.elapsed()))
             });
 
             Ok(())
@@ -221,14 +213,14 @@ proptest! {
         let run_time = started_at.elapsed();
         let shared = sync::Arc::try_unwrap(shared)
             .unwrap_or_else(|e| {
-                eprintln!("couldn't unwrap arc: {:?}", e);
+                info!("couldn't unwrap arc: {:?}", e);
                 panic!("arc still active");
             });
         let interrupted_run_time = if shared.fuse.into_inner() || run_time > MAX_TEST_TIME {
-            eprintln!("timed out");
+            info!("timed out");
             Some(run_time)
         } else {
-            eprintln!("didn't time out");
+            info!("didn't time out");
             None
         };
         let items = shared.items.into_inner().unwrap();
@@ -236,7 +228,7 @@ proptest! {
         for item in items {
             actual_reads[item.reader] += 1;
         }
-        eprintln!("reads match: {:?}", actual_reads == expected_counts);
+        info!("reads match: {:?}", actual_reads == expected_counts);
         prop_assert_eq!((actual_reads, interrupted_run_time), (expected_counts, None));
     }
 }

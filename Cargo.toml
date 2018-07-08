@@ -24,9 +24,10 @@ bench = []
 
 [dependencies]
 atomic-option = "0.1"
-futures = "0.1.14"
-num_cpus = "1.6.2"
+futures = "0.1.21"
+num_cpus = "1.8.0"
 void = "1.0.2"
+log = { version = "0.4", features = ["max_level_debug", "release_max_level_warn"] }
 
 [dev-dependencies]
 proptest = "0.8.1"

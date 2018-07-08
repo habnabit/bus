@@ -122,6 +122,9 @@ use futures::prelude::*;
 use futures::sync::mpsc;
 use futures::task;
 
+#[macro_use]
+extern crate log;
+
 extern crate void;
 
 #[cfg(feature = "bench")]
@@ -266,16 +269,16 @@ impl WaitingReader {
         WaitingReader { task: Some(task::current()), at }
     }
 
-    fn notify(&mut self) {
-        if let Some(t) = self.task.take() {
-            t.notify()
-        }
+    fn notify(self) {
+        // do nothing but drop self
     }
 }
 
 impl Drop for WaitingReader {
     fn drop(&mut self) {
-        self.notify()
+        if let Some(t) = self.task.take() {
+            t.notify()
+        }
     }
 }
 
@@ -459,8 +462,7 @@ impl<T> Bus<T> {
             if waiting.at == tail {
                 self.cache.push(waiting);
             } else {
-                // async note: dropping the WaitingReader notifies its task
-                drop(waiting);
+                waiting.notify();
             }
         }
         for w in self.cache.drain(..) {
@@ -508,25 +510,37 @@ impl<T> Bus<T> {
             closed: false,
         }
     }
+
+    fn try_close(&mut self) -> Poll<(), void::Void> {
+        let was_closed = self.state.closed.swap(true, atomic::Ordering::Relaxed);
+        if !was_closed {
+            // Acquire/Release .tail to ensure other threads see new .closed
+            self.state.tail.fetch_add(0, atomic::Ordering::AcqRel);
+
+            self.leaving.1.close();
+            self.waiting.1.close();
+        }
+
+        loop {
+            match self.waiting.1.poll() {
+                Ok(Async::Ready(Some(t))) => t.notify(),
+                Ok(Async::Ready(None)) => break,
+                Ok(Async::NotReady) => return Ok(Async::NotReady),
+                Err(..) => unreachable!(),
+            }
+        }
+
+        Ok(Async::Ready(()))
+    }
 }
 
 impl<T> Drop for Bus<T> {
     fn drop(&mut self) {
-        self.state.closed.store(true, atomic::Ordering::Relaxed);
-        // Acquire/Release .tail to ensure other threads see new .closed
-        self.state.tail.fetch_add(0, atomic::Ordering::AcqRel);
-
-        self.waiting.1.close();
-        loop {
-            match self.waiting.1.poll() {
-                Ok(Async::Ready(Some(_))) => (),
-                Ok(Async::Ready(None)) => break,
-                Ok(Async::NotReady) => {
-                    eprintln!("!! yielding !!");
-                    std::thread::yield_now();
-                },
-                Err(..) => unreachable!(),
-            }
+        match self.try_close() {
+            Ok(Async::Ready(())) => (),
+            Ok(Async::NotReady) =>
+                warn!("Bus writer {:p} was not closed before drop; some BusReaders might not wake", self),
+            Err(..) => unreachable!(),
         }
     }
 }
@@ -633,6 +647,10 @@ impl<T: Clone + Sync> Sink for Bus<T> {
 
     fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
         Ok(Async::Ready(()))
+    }
+
+    fn close(&mut self) -> Poll<(), Self::SinkError> {
+        self.try_close()
     }
 }
 
