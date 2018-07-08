@@ -32,6 +32,3 @@ log = { version = "0.4", features = ["max_level_debug", "release_max_level_warn"
 [dev-dependencies]
 proptest = "0.8.1"
 tokio = "0.1.7"
-
-[profile.release]
-debug = true
