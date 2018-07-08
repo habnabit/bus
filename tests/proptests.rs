@@ -1,4 +1,4 @@
-extern crate bus;
+extern crate async_bus;
 extern crate futures;
 
 #[macro_use]
@@ -43,7 +43,7 @@ struct SentItem {
 }
 
 impl TestReader {
-    fn spawned(self, bus_reader: bus::BusReader<Instant>, shared: sync::Arc<Shared>) -> impl Future<Item = (), Error = ()> {
+    fn spawned(self, bus_reader: async_bus::BusReader<Instant>, shared: sync::Arc<Shared>) -> impl Future<Item = (), Error = ()> {
         let reader = self.id;
         stream::iter_ok(self.delays)
             .zip(bus_reader)
@@ -177,7 +177,7 @@ proptest! {
             spawn_deadlined(MAX_TEST_TIME, shared.clone(), {
                 let shared = shared.clone();
                 stream::iter_ok(steps)
-                    .fold(bus::Bus::new(buffer), move |mut bus, step| -> Box<Future<Item = bus::Bus<_>, Error = _> + Send> {
+                    .fold(async_bus::Bus::new(buffer), move |mut bus, step| -> Box<Future<Item = bus::Bus<_>, Error = _> + Send> {
                         use RunStep::*;
                         let now = Instant::now();
                         info!("current step: {:?} @{:?}", step, started_at.elapsed());
